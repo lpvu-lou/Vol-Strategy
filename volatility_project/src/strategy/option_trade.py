@@ -8,43 +8,61 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.data.option_loader import OptionLoader
-from src.data.rates_loader import USRatesLoader
+from src.data_loader.option_loader import OptionLoader
+from src.data_loader.rates_loader import USRatesLoader
 from src.strategy.option_selection import select_options
 from src.utils.helpers import check_is_true, ffill_options_data
 from src.config import DAYS_PER_YEAR, TENOR_TO_PERIOD
 
 
 def interpolate_rates(eval_tenor: float, tenors: pd.Series | np.ndarray, rate_curve: pd.Series | np.ndarray) -> float:
-    tenors = np.asarray(tenors)
-    rate_curve = np.asarray(rate_curve)
+    tenors = np.asarray(tenors, dtype=float)
+    rate_curve = np.asarray(rate_curve, dtype=float)
     check_is_true(len(tenors) == len(rate_curve), "Tenors and rate curve must have the same length.")
-    if eval_tenor <= tenors.min():
-        return rate_curve[tenors.argmin()]
-    if eval_tenor >= tenors.max():
-        return rate_curve[tenors.argmax()]
-    idx_above = tenors[tenors >= eval_tenor].argmin()
-    idx_below = tenors[tenors <= eval_tenor].argmax()
+    order = np.argsort(tenors)
+    tenors = tenors[order]
+    rate_curve = rate_curve[order]
+    if eval_tenor <= tenors[0]:
+        return float(rate_curve[0])
+    if eval_tenor >= tenors[-1]:
+        return float(rate_curve[-1])
+
+    idx_above = int(np.searchsorted(tenors, eval_tenor, side="left"))
+    idx_below = idx_above - 1
     tenor_above, tenor_below = tenors[idx_above], tenors[idx_below]
     rate_above, rate_below = rate_curve[idx_above], rate_curve[idx_below]
+    if np.isclose(tenor_above, tenor_below):
+        return float(rate_below)
     weight_above = (eval_tenor - tenor_below) / (tenor_above - tenor_below)
-    return (1 - weight_above) * rate_below + weight_above * rate_above
+    return float((1 - weight_above) * rate_below + weight_above * rate_above)
 
 
 def compute_forward(df_options: pd.DataFrame, df_rates: pd.DataFrame) -> pd.DataFrame:
-    def _compute_values(group: pd.DataFrame) -> pd.DataFrame:
-        group = group.copy()
-        dte = group["day_to_expiration"].iloc[0] / DAYS_PER_YEAR
-        tenors = group[list(TENOR_TO_PERIOD.keys())].columns.map(TENOR_TO_PERIOD).to_numpy()
-        rate_curve = group[list(TENOR_TO_PERIOD.keys())].drop_duplicates().to_numpy().reshape(-1)
-        group["risk_free_rate"] = interpolate_rates(dte, tenors=tenors, rate_curve=rate_curve)
-        return group
-
+    rate_columns = list(TENOR_TO_PERIOD.keys())
+    tenors = np.asarray([TENOR_TO_PERIOD[col] for col in rate_columns], dtype=float)
     df = df_options.merge(df_rates, on="date", how="left")
-    df = df.groupby(["date", "expiration"], group_keys=False).apply(_compute_values).reset_index(drop=True)
+
+    grouped = (
+        df.groupby(["date", "expiration"], as_index=False)[["day_to_expiration", *rate_columns]]
+        .first()
+        .copy()
+    )
+    grouped["risk_free_rate"] = grouped.apply(
+        lambda row: interpolate_rates(
+            row["day_to_expiration"] / DAYS_PER_YEAR,
+            tenors=tenors,
+            rate_curve=row[rate_columns].to_numpy(dtype=float),
+        ),
+        axis=1,
+    )
+    df = df.merge(
+        grouped[["date", "expiration", "risk_free_rate"]],
+        on=["date", "expiration"],
+        how="left",
+    )
     df["forward"] = df["spot"] * np.exp(df["risk_free_rate"] * df["day_to_expiration"] / DAYS_PER_YEAR)
-    df_forward = df.groupby(["ticker", "date", "expiration"])[["forward"]].first().ffill().reset_index()
-    return df.drop(columns=list(TENOR_TO_PERIOD.keys()) + ["forward"]).merge(
+    df_forward = df.groupby(["ticker", "date", "expiration"], as_index=False)[["forward"]].first()
+    return df.drop(columns=rate_columns + ["forward"]).merge(
         df_forward,
         how="left",
         on=["ticker", "date", "expiration"],
@@ -154,18 +172,15 @@ class OptionTrade(OptionLoader, OptionTradeABC):
 class DeltaHedgedOptionTrade(OptionTrade):
     @classmethod
     def _hedge_trades(cls, df_trades: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        grouped = df_trades.copy()
+        grouped["hedge_weight"] = -(grouped["delta"] * grouped["weight"])
         df_hedge = (
-            df_trades.groupby(["date", "ticker", "entry_date"], group_keys=False)
-            .apply(
-                lambda x: pd.Series(
-                    {
-                        "option_id": x["ticker"].iloc[0],
-                        "expiration": x["date"].iloc[0] + pd.offsets.BusinessDay(n=1),
-                        "leg_name": "DELTA_HEDGING",
-                        "weight": -(x["delta"] * x["weight"]).sum(),
-                    }
-                )
+            grouped.groupby(["date", "ticker", "entry_date"], as_index=False)
+            .agg(weight=("hedge_weight", "sum"))
+            .assign(
+                option_id=lambda x: x["ticker"],
+                expiration=lambda x: x["date"] + pd.offsets.BusinessDay(n=1),
+                leg_name="DELTA_HEDGING",
             )
-            .reset_index()
         )
         return pd.concat([df_trades, df_hedge], ignore_index=True).sort_values(by=["date", "option_id"]).reset_index(drop=True)

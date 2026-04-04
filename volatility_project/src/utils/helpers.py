@@ -14,11 +14,11 @@ def check_is_true(condition: bool, message: Optional[str] = None) -> None:
 def ffill_options_data(df: pd.DataFrame) -> pd.DataFrame:
     missing_cols = {"option_id", "date"}.difference(df.columns)
     check_is_true(len(missing_cols) == 0, f"Missing columns: {missing_cols}")
-    return (
-        df.sort_values(by=["option_id", "date"])
-        .groupby("option_id", as_index=True, group_keys=False)
-        .apply(lambda x: x.ffill())
-    )
+    sorted_df = df.sort_values(by=["option_id", "date"]).copy()
+    filled = sorted_df.groupby("option_id", group_keys=False).ffill()
+    # Preserve the original identifier column after the grouped forward-fill.
+    filled["option_id"] = sorted_df["option_id"].to_numpy()
+    return filled
 
 
 def ensure_datetime_indexed_frame(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
