@@ -12,9 +12,11 @@ from src.models.black_scholes_greeks import compute_black_scholes_greeks
 from src.strategy.option_trade import compute_forward
 from src.utils.helpers import check_is_true, ffill_options_data
 
-
+# Backtester for option trading strategies, computing daily PnL and NAV based on position data and market data
 class StrategyBacktester:
     _BACKTEST_COLS = ["date", "option_id", "entry_date", "leg_name", "weight", "ticker"]
+
+    # Columns to compute and store in the PnL DataFrame for each day, including breakdown by Greeks and transaction costs
     _PNL_COLS = [
         "pnl",
         "model_pnl",
@@ -29,6 +31,7 @@ class StrategyBacktester:
         "cash_interest",
     ]
 
+    # Initialize the backtester with a DataFrame of positions, validating required columns and data sufficiency
     def __init__(self, df_positions: pd.DataFrame) -> None:
         missing_cols = set(self._BACKTEST_COLS).difference(df_positions.columns)
         check_is_true(len(missing_cols) == 0, f"Positions data is missing required columns: {missing_cols}")
@@ -40,6 +43,7 @@ class StrategyBacktester:
         self._df_metainfo = pd.DataFrame()
         self._df_drifted_positions = pd.DataFrame()
 
+    # Main method to run the backtest, which preprocesses positions, applies transaction costs, and iteratively computes daily PnL and NAV
     def compute_backtest(self, tcost_args: Optional[dict[str, Any]] = None) -> "StrategyBacktester":
         tcost_args = dict(tcost_args or {})
         spot_spread_bps = float(tcost_args.pop("spot_spread_bps", 1.0))
@@ -56,6 +60,7 @@ class StrategyBacktester:
         df_positions["dv_model"] = df_positions.groupby(["option_id"])["mid_model"].diff().fillna(0.0)
         df_positions["dsigma"] = df_positions.groupby(["option_id"])["implied_volatility"].diff().fillna(0.0)
         df_positions["dS"] = df_positions.groupby(["option_id"])["spot"].diff().fillna(0.0)
+
         # The option dataset's theta is already expressed as a one-day carry.
         df_positions["dt"] = 1.0
         df_positions["prev_theta"] = df_positions.groupby("option_id")["theta"].shift(1).bfill()
@@ -64,11 +69,14 @@ class StrategyBacktester:
         df_positions["prev_vega"] = df_positions.groupby("option_id")["vega"].shift(1).bfill()
         df_positions["obs_date"] = df_positions["entry_date"] - pd.Timedelta(days=1)
 
+        # Scale each position's weight by the NAV observed at entry (obs_date = entry_date - 1).
+        # This makes the strategy self-financing: weights are expressed as a fraction of NAV.
         start_idx = df_positions["date"].min() - pd.Timedelta(days=1)
         df_pnl = pd.DataFrame([[0.0] * len(self._PNL_COLS)], columns=self._PNL_COLS, index=[start_idx])
         df_nav = pd.DataFrame([[1.0, 1.0, 0.0]], columns=["NAV", "cash_account", "position_value"], index=[start_idx])
         drifted_positions = []
 
+        # Iterate through each unique date in the positions data, calculating daily PnL components, cashflows, and updating NAV based on the previous day's state
         for current_date in sorted(df_positions["date"].unique()):
             df_day = df_positions[df_positions["date"] == current_date].copy()
             df_day = df_day.merge(df_nav[["NAV"]], left_on="obs_date", right_index=True, how="left")
@@ -90,9 +98,13 @@ class StrategyBacktester:
             )
             df_day["leverage"] = df_day["effective_weight"] * df_day["spot"]
             df_day["cashflow"] = 0.0
+
+            # cashflow: negative on entry (cash out to buy), positive on expiry (receive payoff)
             df_day.loc[df_day["entry_date"] == df_day["date"], "cashflow"] = -df_day["effective_weight"] * df_day["mid"]
             df_day.loc[df_day["expiration"] == df_day["date"], "cashflow"] = df_day["effective_weight"] * df_day["mid"]
             previous_state = df_nav.iloc[-1]
+
+            # Assume cash earns the risk-free rate, compounded daily
             daily_rate = float(df_day["risk_free_rate"].dropna().mean()) if "risk_free_rate" in df_day.columns and not df_day["risk_free_rate"].dropna().empty else 0.0
             cash_interest = float(previous_state["cash_account"]) * (np.exp(daily_rate / TRADING_DAYS_PER_YEAR) - 1.0)
             df_day["cash_interest"] = 0.0
@@ -101,8 +113,14 @@ class StrategyBacktester:
             total_pnl = float(df_pnl.loc[current_date, "pnl"])
             total_cashflow = float(df_pnl.loc[current_date, "cashflow"])
             total_cash_interest = float(df_pnl.loc[current_date, "cash_interest"])
+
+            # Update NAV: NAV = previous NAV + PnL + cash interest
             current_nav = float(previous_state["NAV"]) + total_pnl + total_cash_interest
+
+            # Cash account tracks the actual cash balance (initial cash + flows + interest)
             current_cash = float(previous_state["cash_account"]) + total_cash_interest + total_cashflow
+
+            # Position value is the residual component of NAV after accounting for cash, representing the mark-to-market value of open positions
             current_position_value = current_nav - current_cash
             df_nav.loc[current_date] = [current_nav, current_cash, current_position_value]
             drifted_positions.append(df_day)
@@ -114,6 +132,7 @@ class StrategyBacktester:
         self._df_drifted_positions = pd.concat(drifted_positions).reset_index(drop=True)
         return self
 
+    # Load market data, build spot pseudo-options, merge with positions, and optionally recompute greeks
     @classmethod
     def _preprocess_positions(
         cls,
@@ -129,6 +148,9 @@ class StrategyBacktester:
         df_rates = USRatesLoader.load_data(start, end)
         df_options = compute_forward(df_options, df_rates)
         half_spread = max(float(spot_spread_bps), 0.0) / 10000.0 / 2.0
+
+        # Build a synthetic spot instrument for each (date, ticker)
+        # This lets spot-delta legs be handled uniformly alongside option legs
         df_spot = (
             df_options.groupby(["date", "ticker"], group_keys=False)
             .apply(
@@ -157,6 +179,8 @@ class StrategyBacktester:
         df_positions_extended = df_positions_cp.merge(df_options_spot, how="left", on=["ticker", "option_id", "date"])
         df_positions_extended = df_positions_extended[(df_positions_extended["date"] <= df_positions_extended["expiration"]) | df_positions_extended["expiration"].isna()]
         df_positions_extended = ffill_options_data(df_positions_extended)
+
+        # Preserve original dataset greeks for auditing before overwriting them
         if recompute_greeks:
             df_positions_extended["dataset_delta"] = df_positions_extended["delta"]
             df_positions_extended["dataset_gamma"] = df_positions_extended["gamma"]
@@ -169,10 +193,12 @@ class StrategyBacktester:
             df_positions_extended["theta"] = df_positions_extended["bs_theta"]
         return df_positions_extended
 
+    # Base implementation of transaction cost application, which can be overridden by subclasses to implement specific cost models
     @classmethod
     def apply_tcost(cls, df_positions: pd.DataFrame, **kwargs) -> pd.DataFrame:
         return df_positions
 
+    # Properties to access the results of the backtest, including daily PnL, NAV, and detailed metainfo. Accessing these before running the backtest will raise an error
     @property
     def pnl(self) -> pd.DataFrame:
         check_is_true(self._is_backtested, "Backtest has not been run yet.")
@@ -193,14 +219,22 @@ class StrategyBacktester:
         check_is_true(self._is_backtested, "Backtest has not been run yet.")
         return self._df_drifted_positions
 
-
+# Backtester that crosses the bid-ask spread on entry and exit dates
+# On entry, buys at ask and sells at bid; on exit, sells at bid and buys at ask
+# Between entry and exit, mark-to-market is done at mid price (no additional cost applied)
 class BacktesterBidAskFromData(StrategyBacktester):
     @classmethod
     def apply_tcost(cls, df_positions: pd.DataFrame, **kwargs) -> pd.DataFrame:
         df_positions_cp = df_positions.copy()
+
+        # For each position, determine if the current date is the entry or exit date, and whether it's a long or short position.
         trade_in_filter = df_positions_cp["entry_date"] == df_positions_cp["date"]
         trade_out_filter = df_positions_cp["expiration"] == df_positions_cp["date"]
+
+        # Short positions: receive bid price on entry, pay ask price on exit
         short_position_filter = df_positions_cp["weight"] < 0
+
+        # Long positions: pay ask price on entry, receive bid price on exit
         long_position_filter = ~short_position_filter
         df_positions_cp["mid"] = np.where(trade_in_filter & short_position_filter, df_positions_cp["bid"], df_positions_cp["mid"])
         df_positions_cp["mid"] = np.where(trade_out_filter & short_position_filter, df_positions_cp["ask"], df_positions_cp["mid"])

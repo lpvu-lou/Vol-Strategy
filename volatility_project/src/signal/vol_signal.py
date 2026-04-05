@@ -6,7 +6,7 @@ import pandas as pd
 from src.models.realized_vol import rolling_realized_volatility
 from src.utils.helpers import ensure_datetime_indexed_frame, merge_on_date
 
-
+# Compute a rolling realised volatility series from spot prices
 def rolling_realized_vol_benchmark(spot: pd.Series, window: int = 21) -> pd.DataFrame:
     spot_series = pd.Series(spot).dropna().astype(float)
     spot_series.index = pd.to_datetime(spot_series.index)
@@ -21,7 +21,7 @@ def rolling_realized_vol_benchmark(spot: pd.Series, window: int = 21) -> pd.Data
         }
     ).dropna(subset=["rolling_realized_vol"])
 
-
+# Compute a weight-averaged implied volatility reference for the option strategy
 def compute_strategy_iv_reference(
     df_positions: pd.DataFrame,
     df_options: pd.DataFrame,
@@ -35,6 +35,8 @@ def compute_strategy_iv_reference(
     if exclude_leg_names:
         positions = positions.loc[~positions["leg_name"].isin(exclude_leg_names)].copy()
     merged = positions.merge(options[[date_col, "option_id", iv_col]], on=[date_col, "option_id"], how="left")
+
+    # Use absolute weights so short legs contribute positively to the average
     merged["abs_weight"] = merged["weight"].abs()
     merged["weighted_iv"] = merged["abs_weight"] * merged[iv_col]
     return (
@@ -46,7 +48,7 @@ def compute_strategy_iv_reference(
         ]]
     )
 
-
+# Construct the volatility trading signal by comparing IV to a model forecast 
 def build_vol_signal(
     df_iv: pd.DataFrame,
     df_sigma_hat: pd.DataFrame,
@@ -73,7 +75,7 @@ def build_vol_signal(
         signal["vol_signal"] = signal["vol_signal"].clip(signal["vol_signal"].quantile(lower), signal["vol_signal"].quantile(upper))
     return signal
 
-
+# Shift the signal forward by lag_business_days to simulate realistic trade execution
 def lag_signal_for_trading(signal_df: pd.DataFrame, lag_business_days: int = 1) -> pd.DataFrame:
     """Observe at t and trade at t+lag."""
 

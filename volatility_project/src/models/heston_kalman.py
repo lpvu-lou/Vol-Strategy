@@ -9,54 +9,64 @@ from scipy.optimize import minimize
 from src.config import TRADING_DAYS_PER_YEAR
 
 
+# Heston stochastic-volatility model with an Unscented Kalman Filter (UKF) for state estimation
 @dataclass
 class HestonKalmanEstimator:
-    kappa: float = 1.2
-    theta: float = 0.04
-    xi: float = 0.6
-    rho: float = -0.5
-    observation_noise: float = 1e-6
-    process_noise: float = 1e-6
-    initial_variance: float = 0.04
-    initial_covariance: float = 0.02
-    variance_floor: float = 1e-8
-    variance_ceiling: float = 4.0
-    drift: float = 0.0
-    rolling_window: int = 126
-    recalibration_frequency: int = 21
+    kappa: float = 1.2   # Mean reversion speed of the variance process
+    theta: float = 0.04  # Long-term mean of the variance process
+    xi: float = 0.6      # Volatility of volatility (vol of vol)
+    rho: float = -0.5    # Correlation between the Brownian motions of the spot and variance processes
+    observation_noise: float = 1e-6    # Variance of the observation noise in the measurement equation
+    process_noise: float = 1e-6        # Variance of the process noise in the state transition equation
+    initial_variance: float = 0.04     # Initial guess for the variance state at the start of filtering (annualized)
+    initial_covariance: float = 0.02   # Initial guess for the variance of the variance state at the start of filtering
+    variance_floor: float = 1e-8       # Hard lower bound on the variance 
+    variance_ceiling: float = 4.0      # Hard upper bound on the variance 
+    drift: float = 0.0                 # Drift term in the measurement equation
+    rolling_window: int = 126          # Number of past observations to use for parameter recalibration (6 mois)
+    recalibration_frequency: int = 21  # Recalibrate parameters every N observations
     auto_calibrate: bool = True
     optimize_rho: bool = True
     calibration_smoothness: float = 1e-3
-    boundary_penalty: float = 1e-4
-    feller_penalty: float = 1e-2
-    boundary_buffer: float = 1e-3
+    boundary_penalty: float = 1e-4     # Penalty for parameters approaching their optimization bounds
+    feller_penalty: float = 1e-2       # Penalty for violating the Feller condition
+    boundary_buffer: float = 1e-3      # Relative buffer inside the optimization bounds to avoid numerical issues
     alpha: float = 0.1
     beta: float = 2.0
     ukf_kappa: float = 0.0
-    innovation_clip_std: float = 6.0
+    innovation_clip_std: float = 6.0   # Clip innovations in the Kalman update to this many standard deviations to improve robustness
 
+    # Initialize internal state and parameter history after the dataclass is created
     def __post_init__(self) -> None:
         self._state_history: pd.DataFrame | None = None
         self._parameter_history: pd.DataFrame | None = None
         self._calibration_history: pd.DataFrame | None = None
 
+    # Time step in years (1 trading day expressed as a fraction of the trading year)
     @property
     def dt(self) -> float:
         return 1.0 / TRADING_DAYS_PER_YEAR
 
+    # Run the UKF filter over spot prices and cache the state history
     def fit(self, spot: pd.Series) -> "HestonKalmanEstimator":
         self._state_history = self.filter(spot)
         return self
 
+    # Fit the filter and immediately return the filtered state DataFrame
     def fit_transform(self, spot: pd.Series) -> pd.DataFrame:
         return self.fit(spot)._state_history.copy()
-
+    
+    # Apply the UKF to a spot-price series and return per-date state estimates
+    # At each step, optionally recalibrate the model parameters using a rolling window of past returns
     def filter(self, spot: pd.Series) -> pd.DataFrame:
         df = self._prepare_spot_frame(spot)
         if df.empty:
             return df.assign(v_hat=pd.Series(dtype=float), sigma_hat=pd.Series(dtype=float))
 
+        # Snapshot current parameters; may be updated during rolling calibration
         current_params = self._current_parameter_vector()
+
+        # Initialize state mean and covariance for the first step of the filter
         state_mean = self._bounded_variance(self.initial_variance)
         state_covariance = max(self.initial_covariance, self.variance_floor)
         recalibration_frequency = max(int(self.recalibration_frequency), 1)
@@ -64,6 +74,7 @@ class HestonKalmanEstimator:
         parameter_rows: list[dict[str, float | pd.Timestamp]] = []
         calibration_rows: list[dict[str, float | pd.Timestamp]] = []
 
+        # Predict-update step: returns posterior mean, covariance, and log-likelihood
         for idx, row in enumerate(df.itertuples(index=False)):
             if self.auto_calibrate and idx >= self.rolling_window and (idx == self.rolling_window or idx % recalibration_frequency == 0):
                 window_returns = df.iloc[idx - self.rolling_window : idx]["log_return"]
@@ -106,6 +117,7 @@ class HestonKalmanEstimator:
         self._calibration_history = pd.DataFrame(calibration_rows)
         return pd.DataFrame(filtered_rows)
 
+    # Compute the mean-reverting expected average variance over a forward horizon
     def forecast_average_variance(
         self,
         variance: pd.Series | np.ndarray | float,
@@ -123,8 +135,11 @@ class HestonKalmanEstimator:
         loading = (1.0 - decay) / (kappa_value * horizon)
         return theta_value + (variance - theta_value) * loading
 
+    # Append forward-variance and forward-sigma columns to a filtered DataFrame
     def add_horizon_forecast(self, filtered_df: pd.DataFrame, horizon_days: int, prefix: str = "horizon") -> pd.DataFrame:
         out = filtered_df.copy()
+
+        # Uses per-row kappa/theta from the filtered output when available, otherwise falls back to the estimator's current parameter values
         kappa = out["kappa_used"] if "kappa_used" in out.columns else self.kappa
         theta = out["theta_used"] if "theta_used" in out.columns else self.theta
         out[f"{prefix}_days"] = horizon_days
@@ -132,6 +147,7 @@ class HestonKalmanEstimator:
         out[f"{prefix}_sigma_hat"] = np.sqrt(out[f"{prefix}_variance_hat"].clip(lower=self.variance_floor))
         return out
 
+    # Clean spot prices and compute daily log-returns; returns a date-indexed DataFrame
     def _prepare_spot_frame(self, spot: pd.Series) -> pd.DataFrame:
         spot_series = pd.Series(spot).dropna().astype(float)
         df = spot_series.rename("spot").to_frame()
@@ -141,6 +157,7 @@ class HestonKalmanEstimator:
         df = df.dropna(subset=["log_return"])
         return df.reset_index(names="date")
 
+    # Return the estimator's current parameters as a clipped/floored dict ready for UKF use
     def _current_parameter_vector(self) -> dict[str, float]:
         return {
             "kappa": max(float(self.kappa), 1e-6),
@@ -151,6 +168,7 @@ class HestonKalmanEstimator:
             "observation_noise": max(float(self.observation_noise), self.variance_floor),
         }
 
+    # Calibrate Heston parameters to a returns window via penalised MLE
     def _fit_window_parameters(
         self,
         returns_window: pd.Series,
@@ -162,6 +180,7 @@ class HestonKalmanEstimator:
         if clean_returns.empty:
             return current_params, self._empty_calibration_diagnostics()
 
+        # Transform to unconstrained space and set bounds for optimization
         initial_guess = np.array(
             [
                 np.log(current_params["kappa"]),
@@ -178,6 +197,8 @@ class HestonKalmanEstimator:
             (-1.83, 1.83),
         ]
 
+        # Objective function for optimization: 
+        # Penalized negative log-likelihood of the returns window under the Heston model with UKF state estimation, plus penalties for parameter smoothness, boundary proximity, and Feller condition violation
         def objective(raw_params: np.ndarray) -> float:
             params = {
                 "kappa": float(np.exp(raw_params[0])),
@@ -195,11 +216,14 @@ class HestonKalmanEstimator:
             return total
 
         result = minimize(objective, initial_guess, method="L-BFGS-B", bounds=bounds)
+        
+        # Fall back to previous parameters if optimisation fails
         if not result.success:
             diagnostics = self._empty_calibration_diagnostics()
             diagnostics["objective_success"] = 0.0
             return current_params, diagnostics
 
+        # Clip solution away from bounds before back-transforming
         clipped = self._clip_inside_bounds(result.x, bounds)
         calibrated_params = {
             "kappa": float(np.exp(clipped[0])),
@@ -221,6 +245,7 @@ class HestonKalmanEstimator:
         diagnostics["used_inner_clip"] = float(not np.allclose(clipped, result.x))
         return calibrated_params, diagnostics
 
+    # Sum negative UKF log-likelihoods over a return array
     def _negative_loglikelihood(self, returns: np.ndarray, params: dict[str, float], initial_variance: float) -> float:
         state_mean = self._bounded_variance(initial_variance)
         state_covariance = max(self.initial_covariance, self.variance_floor)
@@ -238,6 +263,7 @@ class HestonKalmanEstimator:
             return 1e12
         return float(total)
 
+    # Execute one UKF predict-update cycle for a scalar latent variance state
     def _ukf_step(
         self,
         *,
@@ -251,12 +277,15 @@ class HestonKalmanEstimator:
             [self._state_transition(v, z_state, params) for v, z_state, _ in sigma_points],
             dtype=float,
         )
+
+        # Predict step
         predicted_state_mean = float(np.sum(wm * propagated_states))
         predicted_state_mean = self._bounded_variance(predicted_state_mean)
         predicted_state_covariance = float(np.sum(wc * (propagated_states - predicted_state_mean) ** 2))
         predicted_state_covariance += params["process_noise"]
         predicted_state_covariance = max(predicted_state_covariance, self.variance_floor)
 
+        # Update step: propagate measurement sigma points through the measurement function
         measurement_sigma_points, wm, wc = self._augmented_sigma_points(predicted_state_mean, predicted_state_covariance)
         propagated_measurements = np.array(
             [self._measurement_function(v, z_state, z_obs, params) for v, z_state, z_obs in measurement_sigma_points],
@@ -267,12 +296,18 @@ class HestonKalmanEstimator:
         predicted_measurement_covariance = float(np.sum(wc * (propagated_measurements - predicted_measurement_mean) ** 2))
         predicted_measurement_covariance += params["observation_noise"]
         predicted_measurement_covariance = max(predicted_measurement_covariance, self.variance_floor)
+        
+        # Kalman gain: cross-covariance / innovation variance
         cross_covariance = float(
             np.sum(wc * (propagated_state_points - predicted_state_mean) * (propagated_measurements - predicted_measurement_mean))
         )
         kalman_gain = cross_covariance / predicted_measurement_covariance
+
+        # Innovation: actual observation minus predicted measurement
         innovation = observation - predicted_measurement_mean
         innovation_std = np.sqrt(predicted_measurement_covariance)
+
+        # Clip large innovations
         clipped_innovation = float(
             np.clip(
                 innovation,
@@ -285,13 +320,14 @@ class HestonKalmanEstimator:
             predicted_state_covariance - kalman_gain * predicted_measurement_covariance * kalman_gain,
             self.variance_floor,
         )
-        # Use the same innovation in the likelihood and in the state update.
+        # Use the same innovation in the likelihood and in the state update
         loglikelihood = -0.5 * (
             np.log(2.0 * np.pi * predicted_measurement_covariance)
             + (clipped_innovation**2) / predicted_measurement_covariance
         )
         return updated_state_mean, updated_state_covariance, float(loglikelihood)
 
+    # Generate UKF sigma points for an augmented state
     def _augmented_sigma_points(self, state_mean: float, state_covariance: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         augmented_mean = np.array([state_mean, 0.0, 0.0], dtype=float)
         augmented_covariance = np.diag([max(state_covariance, self.variance_floor), 1.0, 1.0])
@@ -309,13 +345,15 @@ class HestonKalmanEstimator:
         wm[0] = lambda_ / scale
         wc[0] = wm[0] + (1.0 - self.alpha**2 + self.beta)
         return sigma_points_array, wm, wc
-
+    
+    # State transition function for the variance process, incorporating mean reversion and stochastic volatility shocks
     def _state_transition(self, variance: float, z_state: float, params: dict[str, float]) -> float:
         variance = self._bounded_variance(variance)
         next_variance = variance + params["kappa"] * (params["theta"] - variance) * self.dt
         next_variance += params["xi"] * np.sqrt(variance * self.dt) * z_state
         return self._bounded_variance(next_variance)
 
+    # Measurement function for the observed log-return, incorporating the variance state and correlated shocks
     def _measurement_function(self, variance: float, z_state: float, z_obs: float, params: dict[str, float]) -> float:
         variance = self._bounded_variance(variance)
         correlated_shock = params["rho"] * z_state + np.sqrt(max(1.0 - params["rho"] ** 2, 1e-10)) * z_obs
@@ -324,6 +362,7 @@ class HestonKalmanEstimator:
     def _bounded_variance(self, value: float) -> float:
         return float(np.clip(value, self.variance_floor, self.variance_ceiling))
 
+    # Soft barrier penalty that grows as parameters approach their optimisation bounds
     def _boundary_penalty(self, raw_params: np.ndarray, bounds: list[tuple[float, float]]) -> float:
         penalty = 0.0
         for value, (lower, upper) in zip(raw_params, bounds):
@@ -337,6 +376,7 @@ class HestonKalmanEstimator:
                 penalty += ((target_gap / upper_gap) - 1.0) ** 2
         return float(penalty)
 
+    # Hard-clip raw parameters to lie strictly inside bounds by boundary_buffer margin
     def _clip_inside_bounds(self, raw_params: np.ndarray, bounds: list[tuple[float, float]]) -> np.ndarray:
         clipped = []
         for value, (lower, upper) in zip(raw_params, bounds):
@@ -345,11 +385,13 @@ class HestonKalmanEstimator:
             clipped.append(np.clip(value, lower + eps, upper - eps))
         return np.asarray(clipped, dtype=float)
 
+    # Penalise violation of the Feller condition
     def _feller_violation_penalty(self, params: dict[str, float]) -> float:
         violation = max(params["xi"] ** 2 - 2.0 * params["kappa"] * params["theta"], 0.0)
         scale = max(params["xi"] ** 2, 1e-12)
         return float((violation / scale) ** 2)
 
+    # Decompose the calibration objective into its constituent penalty terms for diagnostics
     def _objective_components(
         self,
         raw_params: np.ndarray,
